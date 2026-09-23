@@ -350,9 +350,16 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
     function Install-Package([string]$name, [string]$wingetId, [scriptblock]$detect, [string]$manualUrl) {
         if (Test-Winget) {
             Info "Installing $name with winget"
-            Invoke-Logged 'winget.exe' @('install', '--id', $wingetId, '-e', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--scope', 'machine')
-            if (& $detect) { Ok "$name installed"; return $true }
-            Warn "$name was installed but could not be found yet."
+            try {
+                Invoke-Logged 'winget.exe' @('install', '--id', $wingetId, '-e', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--scope', 'machine')
+                if (& $detect) { Ok "$name installed"; return $true }
+                Warn "$name was installed but could not be found yet."
+            } catch {
+                #a broken winget package (for example a download that fails its hash
+                #check) falls back to the manual install instead of aborting
+                Warn "winget could not install $name ($($_.Exception.Message)), the details are in the log file."
+                Warn "Install $name manually: $manualUrl"
+            }
         } else {
             Warn "winget is not available on this system, $name has to be installed manually: $manualUrl"
         }
