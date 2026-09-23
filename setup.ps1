@@ -75,6 +75,9 @@ Options:
   --yes            Accept all defaults without asking
   --help           Show this help
 
+If Project Singularity is already installed, the installer offers to update
+or to uninstall it.
+
 Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2022.
 '@
                 return
@@ -464,28 +467,132 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
     function New-FrameworkDatabase([string]$hbStoreFile) {
         $dbExists = Invoke-MySql ("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='{0}';" -f $DbName) -Scalar
         $userExists = Invoke-MySql ("SELECT COUNT(*) FROM mysql.user WHERE User='{0}';" -f $DbUser) -Scalar
-        if ($dbExists -ne '0' -or $userExists -ne '0') {
-            if ((Test-Path -LiteralPath $hbStoreFile) -and (Select-String -LiteralPath $hbStoreFile -Pattern '"frameworkPassword"' -Quiet)) {
-                Ok "Database $DbName already exists, keeping it"
-                return $null
-            }
-            Fail "Database $DbName or user $DbUser already exists, but no panel configuration was found for it. Remove them or use the existing installation folder."
+        #reinstall: keep the existing database, the panel config already has the password
+        if (($dbExists -ne '0' -or $userExists -ne '0') -and (Test-Path -LiteralPath $hbStoreFile) -and (Select-String -LiteralPath $hbStoreFile -Pattern '"frameworkPassword"' -Quiet)) {
+            Ok "Database $DbName already exists, keeping it"
+            return $null
         }
+        #left over from an uninstall that kept the database: its password is gone
+        #with the old panel config, so the user gets a new one
+        if ($dbExists -ne '0' -or $userExists -ne '0') {
+            Warn "Database $DbName or user $DbUser already exists without a panel configuration (for example after an uninstall that kept the database)."
+            if (-not (Confirm-Choice "Reuse it? The user $DbUser gets a new password, the data is kept." $true)) {
+                Fail "Remove the database $DbName and the user $DbUser, or run the installer again and reuse them."
+            }
+        }
+
         $password = New-Secret 32
-        Invoke-MySql ("CREATE DATABASE ``{0}`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -f $DbName) | Out-Null
-        $state.CreatedDb = $true
-        Write-Log "created database $DbName"
-        $state.CreatedDbUser = $true
+        if ($dbExists -eq '0') {
+            Invoke-MySql ("CREATE DATABASE ``{0}`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -f $DbName) | Out-Null
+            $state.CreatedDb = $true
+            Write-Log "created database $DbName"
+        } else {
+            Write-Log "reusing the existing database $DbName"
+        }
+        if ($userExists -eq '0') { $state.CreatedDbUser = $true }
         $sql = ''
         foreach ($h in $DbUserHosts) {
-            $sql += "CREATE USER '$DbUser'@'$h' IDENTIFIED BY '$password';`n"
+            #IF NOT EXISTS + ALTER covers both a new and a reused user
+            $sql += "CREATE USER IF NOT EXISTS '$DbUser'@'$h' IDENTIFIED BY '$password';`n"
+            $sql += "ALTER USER '$DbUser'@'$h' IDENTIFIED BY '$password';`n"
             $sql += "GRANT ALL PRIVILEGES ON ``$DbName``.* TO '$DbUser'@'$h';`n"
         }
         $sql += "FLUSH PRIVILEGES;`n"
         Invoke-MySql $sql | Out-Null
-        Write-Log "created database user $DbUser with privileges on $DbName only"
+        if ($userExists -eq '0') {
+            Write-Log "created database user $DbUser with privileges on $DbName only"
+        } else {
+            Write-Log "set a new password for the existing database user $DbUser"
+        }
         Ok "Database $DbName with user $DbUser"
         return $password
+    }
+
+    #MARK: Existing install
+    #An installation is recognised by its service, which runs
+    #<install folder>\service\singularity-service.exe.
+    function Find-ExistingInstall {
+        $svc = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction SilentlyContinue
+        if (-not $svc) { return $null }
+        $dir = '(unknown folder)'
+        if ($svc.PathName -match '"?([^"]+)\\service\\singularity-service\.exe') { $dir = $Matches[1] }
+        Write-Log "found an existing installation: $dir"
+        return @{ Dir = $dir; State = [string]$svc.State }
+    }
+
+    #Deletes a folder, including installs of older installer versions whose
+    #files only an elevated administrator could open.
+    function Remove-InstallFolder([string]$dir) {
+        #best effort: a single file that cannot be taken over must not stop the uninstall
+        try { Invoke-Logged 'takeown.exe' @('/f', $dir, '/r', '/d', 'y') } catch { Write-Log $_.Exception.Message }
+        try { Invoke-Logged 'icacls.exe' @($dir, '/reset', '/T', '/C', '/Q') } catch { Write-Log $_.Exception.Message }
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        return -not (Test-Path -LiteralPath $dir)
+    }
+
+    function Uninstall-Existing($existing) {
+        Info 'Uninstalling Project Singularity'
+
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Invoke-Logged 'sc.exe' @('delete', $ServiceName)
+        Ok "Service $ServiceName removed"
+
+        $apache = Find-Apache
+        if ($apache) {
+            $root = Split-Path -Parent (Split-Path -Parent $apache.Exe)
+            $site = Join-Path $root "conf\extra\$ApacheSiteFile"
+            if (Test-Path -LiteralPath $site) {
+                Remove-Item -LiteralPath $site -Force
+                $conf = Join-Path $root 'conf\httpd.conf'
+                $confText = Get-Content -LiteralPath $conf -Raw
+                $confText = $confText -replace "(?m)^# Project Singularity \(setup\.ps1\)\r?\nInclude .*\r?\n?", ''
+                Set-Content -LiteralPath $conf -Value $confText -Encoding ASCII -NoNewline
+                if ($apache.Service) { Restart-Service -Name $apache.Service -ErrorAction SilentlyContinue }
+                Ok 'Apache site removed'
+            }
+        }
+
+        if ($existing.Dir -match '^[A-Za-z]:\\' -and (Test-Path -LiteralPath $existing.Dir)) {
+            if (Confirm-Choice "Delete $($existing.Dir) with the server files, server-data and the panel data?" $true) {
+                if (Remove-InstallFolder $existing.Dir) { Ok "Deleted $($existing.Dir)" }
+                else { Warn "Could not delete $($existing.Dir) completely, please delete it by hand." }
+            } else {
+                Warn "Kept $($existing.Dir)"
+            }
+        }
+
+        $state.MySqlExe = Find-MySql
+        if ($state.MySqlExe) {
+            $dbService = Get-Service | Where-Object { $_.Name -match '^(MariaDB|MySQL)' } | Select-Object -First 1
+            if ($dbService -and $dbService.Status -ne 'Running') { Start-Service -Name $dbService.Name -ErrorAction SilentlyContinue }
+            $connected = $true
+            try { Invoke-MySql 'SELECT 1;' | Out-Null } catch {
+                $secure = Read-Host 'MariaDB root password (leave empty to keep the database)' -AsSecureString
+                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+                try { $state.DbRootPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+                finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+                try { Invoke-MySql 'SELECT 1;' | Out-Null } catch { $connected = $false; Write-Log "database login failed: $($_.Exception.Message)" }
+            }
+            if ($connected) {
+                Warn "The database $DbName holds the framework data (players, inventories, ...)."
+                if (Confirm-Choice "Also delete the database $DbName and the user $DbUser?" $false) {
+                    $sql = "DROP DATABASE IF EXISTS ``$DbName``;`n"
+                    foreach ($h in $DbUserHosts) { $sql += "DROP USER IF EXISTS '$DbUser'@'$h';`n" }
+                    Invoke-MySql $sql | Out-Null
+                    Ok "Database $DbName and user $DbUser deleted"
+                } else {
+                    Ok "Database $DbName kept, a new installation can reuse it"
+                }
+            } else {
+                Warn "Could not log in to the database server, the database $DbName was kept."
+            }
+        }
+
+        Write-Log 'uninstall finished'
+        Write-Host ''
+        Write-Host '  Project Singularity was uninstalled. MariaDB, Apache and the log file were kept.' -ForegroundColor Green
+        Write-Host "  Log file: $($state.LogFile)"
+        Write-Host ''
     }
 
     #MARK: Apache
@@ -880,6 +987,35 @@ public class SingularityServiceHost : ServiceBase {
         Test-Os
         Test-Admin
         Test-Tools
+
+        $existing = Find-ExistingInstall
+        if ($existing) {
+            Info "Project Singularity is already installed in $($existing.Dir) (service $ServiceName`: $($existing.State))."
+            $choice = '1'
+            if (-not $opt.Yes) {
+                Write-Host '  1) Update / reinstall in the same folder'
+                Write-Host '  2) Uninstall'
+                Write-Host '  3) Cancel'
+                $choice = Ask 'Choose' '1'
+            }
+            switch ($choice) {
+                '1' { if ($existing.Dir -match '^[A-Za-z]:\\') { $DefaultDir = $existing.Dir } }
+                '2' {
+                    if ($existing.Dir -match '^[A-Za-z]:\\') {
+                        $uninstallLog = Join-Path (Split-Path -Parent $existing.Dir) 'singularity-install.log'
+                        Copy-Item -LiteralPath $state.LogFile -Destination $uninstallLog -Force
+                        Remove-Item -LiteralPath $state.LogFile -Force
+                        $state.LogFile = $uninstallLog
+                    }
+                    Uninstall-Existing $existing
+                    #nothing to roll back, an uninstall cannot be undone
+                    $state.Ok = $true
+                    return
+                }
+                '3' { Info 'Cancelled, nothing was changed.'; $state.Ok = $true; return }
+                default { Fail "Invalid choice: $choice" }
+            }
+        }
 
         $dirInput = if ($opt.Dir) { $opt.Dir } else { Ask 'Installation folder' $DefaultDir }
         $installDir = Test-InstallDir $dirInput

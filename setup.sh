@@ -41,6 +41,8 @@ readonly SUPPORTED_OS="debian:11 debian:12 ubuntu:22.04 ubuntu:24.04"
 
 
 #MARK: Options
+#the folder of an existing installation replaces the default
+DEFAULT_INSTALL_DIR="$DEFAULT_DIR"
 OPT_DIR=""
 OPT_BUILD=""
 OPT_TAG=""
@@ -62,6 +64,9 @@ Options:
   --no-mariadb     Do not install MariaDB; an existing MariaDB/MySQL server is required
   --yes            Accept all defaults without asking
   --help           Show this help
+
+If Project Singularity is already installed, the installer offers to update
+or to uninstall it.
 
 Supported systems: Debian 11/12, Ubuntu 22.04/24.04.
 EOF
@@ -210,6 +215,7 @@ rollback() {
             run $SUDO systemctl disable "$SERVICE_NAME"
             $SUDO rm -f "$SERVICE_FILE"
             run $SUDO systemctl daemon-reload
+            run $SUDO systemctl reset-failed "$SERVICE_NAME"
             log "removed service $SERVICE_NAME"
         fi
     fi
@@ -371,6 +377,108 @@ check_install_dir() {
 }
 
 
+#MARK: Existing install
+EXISTING_DIR=""
+
+#An installation is recognised by its service unit, which points to run.sh
+#in the install folder.
+detect_existing_install() {
+    $SUDO test -f "$SERVICE_FILE" || return 0
+    local exec_line
+    exec_line="$($SUDO grep -m1 '^ExecStart=' "$SERVICE_FILE" || true)"
+    if [[ "$exec_line" =~ [[:space:]](/[^[:space:]]+)/run\.sh ]]; then
+        EXISTING_DIR="${BASH_REMATCH[1]}"
+    else
+        EXISTING_DIR="(unknown folder)"
+    fi
+    log "found an existing installation: $EXISTING_DIR"
+}
+
+#Returns 0 to continue with an install into the existing folder.
+#Uninstall and cancel end the script.
+handle_existing_install() {
+    [[ -n "$EXISTING_DIR" ]] || return 0
+    local state
+    state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    info "Project Singularity is already installed in $EXISTING_DIR (service $SERVICE_NAME: $state)."
+    local choice="1"
+    if [[ $OPT_YES -ne 1 ]]; then
+        echo "  1) Update / reinstall in the same folder"
+        echo "  2) Uninstall"
+        echo "  3) Cancel"
+        choice="$(ask "Choose" "1")"
+    fi
+    case "$choice" in
+        1) [[ "$EXISTING_DIR" == /* ]] && DEFAULT_INSTALL_DIR="$EXISTING_DIR"; return 0 ;;
+        2) uninstall_existing ;;
+        3) info "Cancelled, nothing was changed." ;;
+        *) die "Invalid choice: $choice" ;;
+    esac
+    #nothing to roll back: an uninstall cannot be undone and cancel changed nothing
+    INSTALL_OK=1
+    exit 0
+}
+
+uninstall_existing() {
+    if [[ "$EXISTING_DIR" == /* ]]; then
+        move_log_next_to "$EXISTING_DIR"
+    fi
+    info "Uninstalling Project Singularity"
+
+    run $SUDO systemctl stop "$SERVICE_NAME" || true
+    run $SUDO systemctl disable "$SERVICE_NAME" || true
+    $SUDO rm -f "$SERVICE_FILE"
+    run $SUDO systemctl daemon-reload
+    #systemd keeps a failed state in memory even without the unit file
+    run $SUDO systemctl reset-failed "$SERVICE_NAME" || true
+    ok "Service $SERVICE_NAME removed"
+
+    local conf="/etc/apache2/sites-available/${APACHE_SITE}.conf"
+    if $SUDO test -f "$conf"; then
+        local domain
+        domain="$($SUDO awk '/^[[:space:]]*ServerName/ {print $2; exit}' "$conf")"
+        run $SUDO a2dissite "$APACHE_SITE" "${APACHE_SITE}-le-ssl" || true
+        $SUDO rm -f "$conf" "/etc/apache2/sites-available/${APACHE_SITE}-le-ssl.conf"
+        if [[ -n "$domain" ]] && $SUDO test -d "/etc/letsencrypt/live/$domain"; then
+            run $SUDO certbot delete --non-interactive --cert-name "$domain" || true
+        fi
+        run $SUDO systemctl reload apache2 || true
+        ok "Apache site removed"
+    fi
+
+    if [[ "$EXISTING_DIR" == /* ]] && $SUDO test -d "$EXISTING_DIR"; then
+        if confirm "Delete $EXISTING_DIR with the server files, server-data and the panel data?" "y"; then
+            $SUDO rm -rf "$EXISTING_DIR"
+            ok "Deleted $EXISTING_DIR"
+        else
+            warn "Kept $EXISTING_DIR"
+        fi
+    fi
+
+    if command -v mysql >/dev/null 2>&1 && echo "SELECT 1;" | mysql_root >/dev/null 2>&1; then
+        warn "The database $DB_NAME holds the framework data (players, inventories, ...)."
+        if confirm "Also delete the database $DB_NAME and the user $DB_USER?" "n"; then
+            local db_host
+            {
+                printf 'DROP DATABASE IF EXISTS `%s`;\n' "$DB_NAME"
+                for db_host in "${DB_USER_HOSTS[@]}"; do
+                    printf "DROP USER IF EXISTS '%s'@'%s';\n" "$DB_USER" "$db_host"
+                done
+            } | mysql_root
+            ok "Database $DB_NAME and user $DB_USER deleted"
+        else
+            ok "Database $DB_NAME kept, a new installation can reuse it"
+        fi
+    fi
+
+    log "uninstall finished"
+    echo
+    echo "  Project Singularity was uninstalled. MariaDB, Apache and the log file were kept."
+    echo "  Log file: $LOG_FILE"
+    echo
+}
+
+
 #MARK: MariaDB
 setup_mariadb() {
     if command -v mysqld >/dev/null 2>&1 || command -v mariadbd >/dev/null 2>&1; then
@@ -397,30 +505,46 @@ create_database() {
     db_exists="$(printf "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='%s';\n" "$DB_NAME" | mysql_root -N)"
     user_exists="$(printf "SELECT COUNT(*) FROM mysql.user WHERE User='%s';\n" "$DB_USER" | mysql_root -N)"
 
+    #reinstall: keep the existing database, the panel config already has the password
+    if [[ "$db_exists" != "0" || "$user_exists" != "0" ]] \
+        && $SUDO test -f "$HB_STORE_FILE" && $SUDO grep -q '"frameworkPassword"' "$HB_STORE_FILE"; then
+        ok "Database $DB_NAME already exists, keeping it"
+        DB_PASSWORD=""
+        return
+    fi
+
+    #left over from an uninstall that kept the database: its password is gone
+    #with the old panel config, so the user gets a new one
     if [[ "$db_exists" != "0" || "$user_exists" != "0" ]]; then
-        #reinstall: keep the existing database, the panel config already has the password
-        if $SUDO test -f "$HB_STORE_FILE" && $SUDO grep -q '"frameworkPassword"' "$HB_STORE_FILE"; then
-            ok "Database $DB_NAME already exists, keeping it"
-            DB_PASSWORD=""
-            return
-        fi
-        die "Database $DB_NAME or user $DB_USER already exists, but no panel configuration was found for it. Remove them or use the existing installation folder."
+        warn "Database $DB_NAME or user $DB_USER already exists without a panel configuration (for example after an uninstall that kept the database)."
+        confirm "Reuse it? The user $DB_USER gets a new password, the data is kept." "y" \
+            || die "Remove the database $DB_NAME and the user $DB_USER, or run the installer again and reuse them."
     fi
 
     DB_PASSWORD="$(random_secret 32)"
-    printf 'CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n' "$DB_NAME" | mysql_root
-    CREATED_DB=1
-    log "created database $DB_NAME"
-    CREATED_DB_USER=1
+    if [[ "$db_exists" == "0" ]]; then
+        printf 'CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n' "$DB_NAME" | mysql_root
+        CREATED_DB=1
+        log "created database $DB_NAME"
+    else
+        log "reusing the existing database $DB_NAME"
+    fi
+    [[ "$user_exists" == "0" ]] && CREATED_DB_USER=1
     local db_host
     {
         for db_host in "${DB_USER_HOSTS[@]}"; do
-            printf "CREATE USER '%s'@'%s' IDENTIFIED BY '%s';\n" "$DB_USER" "$db_host" "$DB_PASSWORD"
+            #IF NOT EXISTS + ALTER covers both a new and a reused user
+            printf "CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s';\n" "$DB_USER" "$db_host" "$DB_PASSWORD"
+            printf "ALTER USER '%s'@'%s' IDENTIFIED BY '%s';\n" "$DB_USER" "$db_host" "$DB_PASSWORD"
             printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'%s';\n" "$DB_NAME" "$DB_USER" "$db_host"
         done
         printf "FLUSH PRIVILEGES;\n"
     } | mysql_root
-    log "created database user $DB_USER with privileges on $DB_NAME only"
+    if [[ "$user_exists" == "0" ]]; then
+        log "created database user $DB_USER with privileges on $DB_NAME only"
+    else
+        log "set a new password for the existing database user $DB_USER"
+    fi
     ok "Database $DB_NAME with user $DB_USER"
 }
 
@@ -804,8 +928,10 @@ main() {
     check_os
     check_privileges
     install_tools
+    detect_existing_install
+    handle_existing_install
 
-    INSTALL_DIR="${OPT_DIR:-$(ask "Installation folder" "$DEFAULT_DIR")}"
+    INSTALL_DIR="${OPT_DIR:-$(ask "Installation folder" "$DEFAULT_INSTALL_DIR")}"
     check_install_dir
     move_log_next_to "$INSTALL_DIR"
     ok "Installation folder $INSTALL_DIR"
