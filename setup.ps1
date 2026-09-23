@@ -389,19 +389,65 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
             Ok 'MariaDB/MySQL client found'
         }
         $dbService = Get-Service | Where-Object { $_.Name -match '^(MariaDB|MySQL)' } | Select-Object -First 1
-        if ($dbService -and $dbService.Status -ne 'Running') { Start-Service -Name $dbService.Name }
+        if (-not $dbService) { $dbService = Register-MariaDbService }
+        if ($dbService.Status -ne 'Running') {
+            Start-Service -Name $dbService.Name
+            (Get-Service -Name $dbService.Name).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+        }
+        Ok "Database service $($dbService.Name) is running"
 
         #root without a password first (fresh MariaDB install), then ask
         try {
             Invoke-MySql 'SELECT 1;' | Out-Null
         } catch {
+            Write-Log "root login without a password failed: $($_.Exception.Message)"
             $secure = Read-Host 'MariaDB root password' -AsSecureString
             $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
             try { $state.DbRootPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
             finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-            try { Invoke-MySql 'SELECT 1;' | Out-Null } catch { Fail 'Cannot connect to the database server as root.' }
+            try {
+                Invoke-MySql 'SELECT 1;' | Out-Null
+            } catch {
+                #the mysql message says why (wrong password, server not reachable), never the password
+                Write-Log "root login with the given password failed: $($_.Exception.Message)"
+                Fail 'Cannot connect to the database server as root. Details are in the log file.'
+            }
         }
         Ok 'Connected to the database server'
+    }
+
+    #A silent MariaDB MSI install (winget --silent) copies the programs and may
+    #create the data folder, but registers no Windows service. This registers one
+    #for an existing data folder, or creates the instance if there is none.
+    #Like the MariaDB install itself, the service is kept on rollback.
+    function Register-MariaDbService {
+        $binDir = Split-Path -Parent $state.MySqlExe
+        $baseDir = Split-Path -Parent $binDir
+        $dataDir = Join-Path $baseDir 'data'
+        $myIni = Join-Path $dataDir 'my.ini'
+        $serviceName = 'MariaDB'
+
+        if (Test-Path -LiteralPath $myIni) {
+            Info "Registering the Windows service for the existing MariaDB data folder"
+            $server = Join-Path $binDir 'mariadbd.exe'
+            if (-not (Test-Path -LiteralPath $server)) { $server = Join-Path $binDir 'mysqld.exe' }
+            Invoke-Logged $server @('--install', $serviceName, "--defaults-file=$myIni")
+        } else {
+            $installDb = Join-Path $binDir 'mariadb-install-db.exe'
+            if (-not (Test-Path -LiteralPath $installDb)) { $installDb = Join-Path $binDir 'mysql_install_db.exe' }
+            if (-not (Test-Path -LiteralPath $installDb)) {
+                Fail "MariaDB has no database service and $installDb was not found. Install MariaDB with its installer and run this installer again."
+            }
+            Info 'Creating the MariaDB database instance and service'
+            #no root password: root can only log in locally, like a default MariaDB install
+            Invoke-Logged $installDb @("--datadir=$dataDir", "--service=$serviceName", '--port=3306')
+        }
+
+        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if (-not $svc) { Fail 'The MariaDB service could not be registered. Details are in the log file.' }
+        Set-Service -Name $serviceName -StartupType Automatic
+        Write-Log "registered the Windows service $serviceName"
+        return $svc
     }
 
     function New-FrameworkDatabase([string]$hbStoreFile) {
