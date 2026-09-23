@@ -817,7 +817,14 @@ main() {
     choose_artifact
     resolve_release
 
-    make_dir "$INSTALL_DIR"
+    #An empty folder that already exists is treated as created by this run,
+    #so a rollback removes it with everything extracted into it.
+    if $SUDO test -d "$INSTALL_DIR" && [[ -z "$($SUDO ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
+        CREATED_PATHS+=("$INSTALL_DIR")
+        log "$INSTALL_DIR exists but is empty, it is removed again on rollback"
+    else
+        make_dir "$INSTALL_DIR"
+    fi
     install_artifact
     install_panel
     setup_server_data

@@ -265,7 +265,11 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
 
         for ($j = $state.CreatedPaths.Count - 1; $j -ge 0; $j--) {
             Remove-Item -LiteralPath $state.CreatedPaths[$j] -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "removed $($state.CreatedPaths[$j])"
+            if (Test-Path -LiteralPath $state.CreatedPaths[$j]) {
+                Warn "Could not remove $($state.CreatedPaths[$j]), please delete it by hand."
+            } else {
+                Write-Log "removed $($state.CreatedPaths[$j])"
+            }
         }
         Warn "Rollback finished. Details: $($state.LogFile)"
     }
@@ -895,7 +899,14 @@ public class SingularityServiceHost : ServiceBase {
         $artifact = Select-Artifact
         $release = Resolve-Release
 
-        New-TrackedDir $installDir
+        #An empty folder that already exists is treated as created by this run,
+        #so a rollback removes it with everything extracted into it.
+        if ((Test-Path -LiteralPath $installDir) -and -not (Get-ChildItem -LiteralPath $installDir -Force | Select-Object -First 1)) {
+            [void]$state.CreatedPaths.Add($installDir)
+            Write-Log "$installDir exists but is empty, it is removed again on rollback"
+        } else {
+            New-TrackedDir $installDir
+        }
         Install-Artifact $artifact $installDir
         Install-Panel $release $installDir
 
