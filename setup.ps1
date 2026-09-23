@@ -707,8 +707,13 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
     }
 
     #Owner, SYSTEM and Administrators only, the Windows equivalent of 750/600.
+    #The rights are set on the folder only; everything below is reset to inherit
+    #them. Applying the folder ACEs to each file with /T would drop the inherited
+    #rights of the files without granting new ones, locking everyone but an
+    #elevated administrator out.
     function Set-RestrictedAcl([string]$path, [string]$user) {
-        Invoke-Logged 'icacls.exe' @($path, '/inheritance:r', '/grant:r', "${user}:(OI)(CI)F", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '/T', '/C', '/Q')
+        Invoke-Logged 'icacls.exe' @($path, '/inheritance:r', '/grant:r', "${user}:(OI)(CI)F", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '/Q')
+        Invoke-Logged 'icacls.exe' @((Join-Path $path '*'), '/reset', '/T', '/C', '/Q')
     }
     function Set-RestrictedFileAcl([string]$path, [string]$user) {
         Invoke-Logged 'icacls.exe' @($path, '/inheritance:r', '/grant:r', "${user}:F", '*S-1-5-18:F', '*S-1-5-32-544:F', '/Q')
