@@ -520,13 +520,35 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
         return @{ Dir = $dir; State = [string]$svc.State }
     }
 
+    #Ends every process still running from the install folder. Older versions of
+    #the service host could leave FXServer running after the service stopped,
+    #which keeps its files locked.
+    function Stop-InstallProcesses([string]$dir) {
+        $prefix = $dir.TrimEnd('\') + '\'
+        for ($k = 0; $k -lt 10; $k++) {
+            $procs = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+            if (-not $procs.Count) { return }
+            foreach ($pr in $procs) {
+                Write-Log "stopping leftover process $($pr.ProcessId) $($pr.ExecutablePath)"
+                Stop-Process -Id $pr.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 1
+        }
+        Warn "Some processes from $dir are still running."
+    }
+
     #Deletes a folder, including installs of older installer versions whose
     #files only an elevated administrator could open.
     function Remove-InstallFolder([string]$dir) {
+        Stop-InstallProcesses $dir
         #best effort: a single file that cannot be taken over must not stop the uninstall
         try { Invoke-Logged 'takeown.exe' @('/f', $dir, '/r', '/d', 'y') } catch { Write-Log $_.Exception.Message }
         try { Invoke-Logged 'icacls.exe' @($dir, '/reset', '/T', '/C', '/Q') } catch { Write-Log $_.Exception.Message }
-        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        #files of a just ended process can stay locked for a moment
+        for ($k = 0; $k -lt 5 -and (Test-Path -LiteralPath $dir); $k++) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $dir) { Start-Sleep -Seconds 2 }
+        }
         return -not (Test-Path -LiteralPath $dir)
     }
 
@@ -835,18 +857,48 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
     #MARK: Service
     #FXServer.exe is a console program, not a Windows service. This small host
     #is compiled with the csc.exe that ships with .NET Framework 4, so no third
-    #party tool is needed. It starts FXServer, stops it with the process tree,
+    #party tool is needed. It runs FXServer in a kill-on-close job object, so
+    #stopping the service always ends FXServer and the game server it started,
     #and exits with an error if FXServer dies so the service recovery restarts it.
     $ServiceHostSource = @'
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.ServiceProcess;
 
 public class SingularityServiceHost : ServiceBase {
+    //FXServer and every process it starts run in a job object that is
+    //killed when this host closes it or exits in any way, so a stopped or
+    //crashed service can never leave FXServer processes behind.
+    [StructLayout(LayoutKind.Sequential)]
+    struct BasicLimits {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IoCounters { public ulong a, b, c, d, e, f; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ExtendedLimits {
+        public BasicLimits Basic;
+        public IoCounters Io;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    const int JobObjectExtendedLimitInformation = 9;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+    [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimits info, uint length);
+    [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
     private Process proc;
     private StreamWriter stdin;
-    private bool stopping;
+    private IntPtr job = IntPtr.Zero;
+    private volatile bool stopping;
     private readonly string baseDir = AppDomain.CurrentDomain.BaseDirectory;
 
     public SingularityServiceHost() { ServiceName = "singularity"; CanStop = true; CanShutdown = true; }
@@ -859,7 +911,18 @@ public class SingularityServiceHost : ServiceBase {
         throw new Exception("Missing setting " + key);
     }
 
+    private void CreateKillOnCloseJob() {
+        job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Exception("CreateJobObject failed: " + Marshal.GetLastWin32Error());
+        var limits = new ExtendedLimits();
+        limits.Basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
+            throw new Exception("SetInformationJobObject failed: " + Marshal.GetLastWin32Error());
+        }
+    }
+
     protected override void OnStart(string[] args) {
+        CreateKillOnCloseJob();
         var psi = new ProcessStartInfo(Setting("fxserver"));
         psi.WorkingDirectory = Setting("workdir");
         psi.UseShellExecute = false;
@@ -876,8 +939,14 @@ public class SingularityServiceHost : ServiceBase {
         proc.EnableRaisingEvents = true;
         proc.OutputDataReceived += (s, e) => { if (e.Data != null) lock (log) log.WriteLine(e.Data); };
         proc.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (log) log.WriteLine(e.Data); };
-        proc.Exited += (s, e) => { if (!stopping) Environment.Exit(1); };
+        //FXServer died on its own: end the whole job and let the service recovery restart it
+        proc.Exited += (s, e) => { if (!stopping) { TerminateJobObject(job, 1); Environment.Exit(1); } };
         proc.Start();
+        //FXServer only starts its child processes later, so they all land in the job
+        if (!AssignProcessToJobObject(job, proc.Handle)) {
+            proc.Kill();
+            throw new Exception("AssignProcessToJobObject failed: " + Marshal.GetLastWin32Error());
+        }
         stdin = proc.StandardInput;
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
@@ -885,12 +954,12 @@ public class SingularityServiceHost : ServiceBase {
 
     private void StopServer() {
         stopping = true;
-        if (proc == null || proc.HasExited) return;
-        try { stdin.WriteLine("quit"); stdin.Flush(); } catch { }
-        if (!proc.WaitForExit(30000)) {
-            var kill = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + proc.Id + " /T /F") { UseShellExecute = false, CreateNoWindow = true });
-            kill.WaitForExit(15000);
+        if (proc != null && !proc.HasExited) {
+            try { stdin.WriteLine("quit"); stdin.Flush(); } catch { }
+            //a short grace period, well within the time Windows gives a stopping service
+            proc.WaitForExit(5000);
         }
+        if (job != IntPtr.Zero) TerminateJobObject(job, 0);
     }
 
     protected override void OnStop() { StopServer(); }
@@ -999,7 +1068,18 @@ public class SingularityServiceHost : ServiceBase {
                 $choice = Ask 'Choose' '1'
             }
             switch ($choice) {
-                '1' { if ($existing.Dir -match '^[A-Za-z]:\\') { $DefaultDir = $existing.Dir } }
+                '1' {
+                    if ($existing.Dir -match '^[A-Za-z]:\\') {
+                        $DefaultDir = $existing.Dir
+                        #files are replaced in place, so nothing may run from the folder
+                        if ($existing.State -eq 'Running') {
+                            Info "Stopping the running $ServiceName service for the update."
+                            $state.ServiceWasRunning = $true
+                            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+                        }
+                        Stop-InstallProcesses $existing.Dir
+                    }
+                }
                 '2' {
                     if ($existing.Dir -match '^[A-Za-z]:\\') {
                         $uninstallLog = Join-Path (Split-Path -Parent $existing.Dir) 'singularity-install.log'
