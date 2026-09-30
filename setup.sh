@@ -31,6 +31,11 @@ readonly DB_NAME="singularity_framework"
 readonly DB_USER="sg_framework"
 readonly SERVICE_NAME="singularity"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+#Runs update-guard.sh in its own unit, so it survives the restart of the panel
+#service (systemd kills every process left in a service's cgroup on restart).
+readonly GUARD_UNIT="singularity-update-guard"
+readonly GUARD_PATH_FILE="/etc/systemd/system/${GUARD_UNIT}.path"
+readonly GUARD_SERVICE_FILE="/etc/systemd/system/${GUARD_UNIT}.service"
 readonly APACHE_SITE="singularity"
 readonly ARTIFACT_LIST_SIZE=10
 readonly MAX_MONITOR_BACKUPS=3
@@ -185,6 +190,8 @@ CREATED_DB_USER=0
 CREATED_SERVICE=0
 SERVICE_UNIT_BACKUP=""
 SERVICE_WAS_ACTIVE=0
+CREATED_GUARD_UNITS=0
+GUARD_UNITS_BACKUP=""
 CREATED_APACHE_SITE=0
 CREATED_CERT_DOMAIN=""
 MONITOR_PATH=""
@@ -217,6 +224,20 @@ rollback() {
             run $SUDO systemctl daemon-reload
             run $SUDO systemctl reset-failed "$SERVICE_NAME"
             log "removed service $SERVICE_NAME"
+        fi
+    fi
+    if [[ $CREATED_GUARD_UNITS -eq 1 || -n "$GUARD_UNITS_BACKUP" ]]; then
+        run $SUDO systemctl disable --now "${GUARD_UNIT}.path"
+        if [[ -n "$GUARD_UNITS_BACKUP" ]]; then
+            $SUDO cp "$GUARD_UNITS_BACKUP/${GUARD_UNIT}.path" "$GUARD_PATH_FILE"
+            $SUDO cp "$GUARD_UNITS_BACKUP/${GUARD_UNIT}.service" "$GUARD_SERVICE_FILE"
+            run $SUDO systemctl daemon-reload
+            run $SUDO systemctl enable --now "${GUARD_UNIT}.path"
+            log "restored the previous update guard units"
+        else
+            $SUDO rm -f "$GUARD_PATH_FILE" "$GUARD_SERVICE_FILE"
+            run $SUDO systemctl daemon-reload
+            log "removed the update guard units"
         fi
     fi
 
@@ -432,6 +453,11 @@ uninstall_existing() {
     #systemd keeps a failed state in memory even without the unit file
     run $SUDO systemctl reset-failed "$SERVICE_NAME" || true
     ok "Service $SERVICE_NAME removed"
+
+    run $SUDO systemctl disable --now "${GUARD_UNIT}.path" || true
+    $SUDO rm -f "$GUARD_PATH_FILE" "$GUARD_SERVICE_FILE"
+    run $SUDO systemctl daemon-reload
+    run $SUDO systemctl reset-failed "${GUARD_UNIT}.service" || true
 
     local conf="/etc/apache2/sites-available/${APACHE_SITE}.conf"
     if $SUDO test -f "$conf"; then
@@ -801,6 +827,8 @@ write_panel_config() {
     local profile="$TXDATA/default"
     make_dir "$TXDATA"
     make_dir "$profile"
+    #watched by the update guard path unit, see setup_update_guard
+    make_dir "$TXDATA/updates"
 
     if $SUDO test -f "$profile/config.json"; then
         log "kept the existing panel configuration $profile/config.json"
@@ -878,9 +906,11 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${SERVER_DATA}
 Environment=SINGULARITY_DATA_PATH=${TXDATA}
+Environment=SINGULARITY_UPDATE_GUARD=systemd
 ${env_url}
 ExecStart=/usr/bin/env bash ${INSTALL_DIR}/run.sh
-Restart=on-failure
+#always: the panel exits with code 0 to finish a panel update
+Restart=always
 RestartSec=10
 KillSignal=SIGINT
 TimeoutStopSec=60
@@ -893,6 +923,52 @@ EOF
     run $SUDO systemctl daemon-reload
     run $SUDO systemctl enable "$SERVICE_NAME"
     ok "Service $SERVICE_NAME created"
+    setup_update_guard
+}
+
+#The panel writes $TXDATA/updates/guard.request right before it restarts to
+#finish an update; the path unit then starts update-guard.sh as its own unit,
+#which rolls the update back if the new version does not come up in time.
+setup_update_guard() {
+    if [[ -f "$GUARD_PATH_FILE" && -f "$GUARD_SERVICE_FILE" ]]; then
+        $SUDO mkdir -p "$WORK_DIR/guard-units.bak"
+        $SUDO cp "$GUARD_PATH_FILE" "$GUARD_SERVICE_FILE" "$WORK_DIR/guard-units.bak/"
+        GUARD_UNITS_BACKUP="$WORK_DIR/guard-units.bak"
+        log "backed up the existing update guard units"
+    else
+        CREATED_GUARD_UNITS=1
+    fi
+
+    $SUDO tee "$GUARD_SERVICE_FILE" >/dev/null <<EOF
+# Project Singularity, created by setup.sh
+[Unit]
+Description=Project Singularity update guard (rolls back a failed panel update)
+
+[Service]
+Type=oneshot
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+ExecStart=/bin/sh ${TXDATA}/updates/update-guard.sh --request ${TXDATA}/updates/guard.request
+#longer than the panel's largest readyTimeoutSeconds plus the rollback itself
+TimeoutStartSec=30min
+EOF
+
+    $SUDO tee "$GUARD_PATH_FILE" >/dev/null <<EOF
+# Project Singularity, created by setup.sh
+[Unit]
+Description=Project Singularity update guard trigger
+
+[Path]
+PathExists=${TXDATA}/updates/guard.request
+Unit=${GUARD_UNIT}.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    $SUDO chmod 644 "$GUARD_SERVICE_FILE" "$GUARD_PATH_FILE"
+    run $SUDO systemctl daemon-reload
+    run $SUDO systemctl enable --now "${GUARD_UNIT}.path"
+    ok "Update guard ${GUARD_UNIT}.path enabled"
 }
 
 set_permissions() {
