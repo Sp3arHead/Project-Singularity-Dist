@@ -860,12 +860,166 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
     #party tool is needed. It runs FXServer in a kill-on-close job object, so
     #stopping the service always ends FXServer and the game server it started,
     #and exits with an error if FXServer dies so the service recovery restarts it.
+    #It is also the update guard of the panel update: see the UpdateGuard class.
     $ServiceHostSource = @'
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+
+//Panel update, Windows side. The panel swaps its folder, writes
+//updates\guard.request and exits; the service recovery starts this host again,
+//which claims the request and watches the new version. If it does not report
+//"done" within ready_timeout seconds, the backup is put back and the service
+//restarts with the old version. The claimed request (guard.request.active)
+//survives restarts, so a new version that keeps crashing is rolled back too.
+//A separate guard process would not work here: the job object below ends every
+//process FXServer started, the guard included.
+class UpdateGuard {
+    public enum Result { Done, Stopped, TimedOut }
+
+    private readonly Dictionary<string, string> values = new Dictionary<string, string>();
+    private readonly string activePath;
+    private readonly DateTime deadline;
+    private readonly string logFile;
+
+    private UpdateGuard(string activePath) {
+        this.activePath = activePath;
+        foreach (var line in File.ReadAllLines(activePath)) {
+            var idx = line.IndexOf('=');
+            if (idx > 0) values[line.Substring(0, idx).Trim()] = line.Substring(idx + 1).Trim();
+        }
+        logFile = Value("log_file");
+        if (logFile.Length == 0 || !Path.IsPathRooted(logFile)) logFile = Path.Combine(Path.GetDirectoryName(activePath), "update-guard.log");
+        foreach (var key in new[] { "state_file", "monitor_path", "backup_path" }) {
+            if (!Path.IsPathRooted(Value(key))) throw new Exception(key + " is not an absolute path");
+        }
+        if (!Regex.IsMatch(Value("to_version"), "^[0-9.]+$")) throw new Exception("to_version is not a version");
+        if (Value("supervisor") != "windows-service") throw new Exception("unsupported supervisor: " + Value("supervisor"));
+        int timeout;
+        if (!int.TryParse(Value("ready_timeout"), out timeout) || timeout <= 0) throw new Exception("ready_timeout is not a number");
+        deadline = File.GetLastWriteTime(activePath).AddSeconds(timeout);
+    }
+
+    private string Value(string key) { string v; return values.TryGetValue(key, out v) ? v : ""; }
+
+    public void Log(string msg) {
+        try { File.AppendAllText(logFile, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [service] " + msg + Environment.NewLine); } catch { }
+    }
+
+    /** Claims a new request or resumes a claimed one; null if there is none. */
+    public static UpdateGuard Prepare(string dataPath) {
+        var dir = Path.Combine(dataPath, "updates");
+        var request = Path.Combine(dir, "guard.request");
+        var active = request + ".active";
+        var claimed = false;
+        try {
+            if (File.Exists(request)) {
+                if (File.Exists(active)) File.Delete(active);
+                File.Move(request, active);
+                //the timeout counts from the claim
+                File.SetLastWriteTime(active, DateTime.Now);
+                claimed = true;
+            }
+            if (!File.Exists(active)) return null;
+            var guard = new UpdateGuard(active);
+            guard.Log(claimed
+                ? "guard started (supervisor: windows-service, target version: " + guard.Value("to_version") + ", deadline: " + guard.deadline.ToString("HH:mm:ss") + ")"
+                : "guard resumed after a service restart");
+            return guard;
+        } catch (Exception ex) {
+            try {
+                File.AppendAllText(Path.Combine(dir, "update-guard.log"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [service] ERROR: invalid request, ignored: " + ex.Message + Environment.NewLine);
+                File.Delete(active);
+            } catch { }
+            return null;
+        }
+    }
+
+    public bool Expired { get { return DateTime.Now >= deadline; } }
+
+    /** The panel writes its state file with JSON.stringify(state, null, 2). */
+    public bool IsDone() {
+        try {
+            var text = File.ReadAllText(Value("state_file"));
+            return text.Contains("\"phase\": \"done\"") && text.Contains("\"toVersion\": \"" + Value("to_version") + "\"");
+        } catch { return false; }
+    }
+
+    public Result Wait(Func<bool> stopRequested) {
+        while (!Expired) {
+            if (IsDone()) { Finish(); return Result.Done; }
+            if (stopRequested()) { Log("service is stopping, the guard resumes at the next start"); return Result.Stopped; }
+            Thread.Sleep(2000);
+        }
+        if (IsDone()) { Finish(); return Result.Done; }
+        return Result.TimedOut;
+    }
+
+    /** True if the new version already reported ready (e.g. after a restart). */
+    public bool FinishIfDone() {
+        if (!IsDone()) return false;
+        Finish();
+        return true;
+    }
+
+    private void Finish() {
+        Log("version " + Value("to_version") + " reported ready, update finished");
+        try { File.Delete(activePath); } catch { }
+    }
+
+    /** Must only run while FXServer is not running. */
+    public void Rollback() {
+        try {
+            Log("version " + Value("to_version") + " did not report ready in time, rolling back");
+            var monitor = Value("monitor_path");
+            var backup = Value("backup_path");
+            if (!Directory.Exists(backup)) {
+                Log("ERROR: backup not found, cannot roll back: " + backup);
+                return;
+            }
+            var failed = Path.Combine(Path.GetDirectoryName(backup), "monitor.failed." + DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+            if (Directory.Exists(monitor)) {
+                MoveDir(monitor, failed);
+                Log("moved the failed monitor folder to " + failed);
+            }
+            MoveDir(backup, monitor);
+            Log("restored the backup " + backup + " to " + monitor);
+            try {
+                var state = Value("state_file");
+                var tmp = state + ".guard.tmp";
+                var text = File.ReadAllText(state).Replace("\"phase\": \"applying\"", "\"phase\": \"rolledBack\"");
+                //no BOM: the panel parses the file as plain JSON
+                File.WriteAllText(tmp, text, new UTF8Encoding(false));
+                File.Copy(tmp, state, true);
+                File.Delete(tmp);
+                Log("state set to rolledBack");
+            } catch (Exception ex) {
+                Log("WARNING: could not update the state file: " + ex.Message);
+            }
+            Log("rollback finished, the service restarts with the previous version");
+        } catch (Exception ex) {
+            Log("ERROR: rollback failed: " + ex.Message);
+        } finally {
+            try { File.Delete(activePath); } catch { }
+        }
+    }
+
+    //Windows may hold file handles of a just-killed process for a moment.
+    private static void MoveDir(string src, string dest) {
+        for (var i = 0; ; i++) {
+            try { Directory.Move(src, dest); return; }
+            catch (IOException) { if (i >= 14) throw; }
+            catch (UnauthorizedAccessException) { if (i >= 14) throw; }
+            Thread.Sleep(1000);
+        }
+    }
+}
 
 public class SingularityServiceHost : ServiceBase {
     //FXServer and every process it starts run in a job object that is
@@ -922,6 +1076,13 @@ public class SingularityServiceHost : ServiceBase {
     }
 
     protected override void OnStart(string[] args) {
+        //Panel update: roll back before FXServer starts if the time is already up
+        var guard = UpdateGuard.Prepare(Setting("datapath"));
+        if (guard != null && (guard.FinishIfDone() || guard.Expired)) {
+            if (guard.Expired && !guard.IsDone()) guard.Rollback();
+            guard = null;
+        }
+
         CreateKillOnCloseJob();
         var psi = new ProcessStartInfo(Setting("fxserver"));
         psi.WorkingDirectory = Setting("workdir");
@@ -930,6 +1091,8 @@ public class SingularityServiceHost : ServiceBase {
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         psi.EnvironmentVariables["SINGULARITY_DATA_PATH"] = Setting("datapath");
+        //tells the panel that this host guards its updates
+        psi.EnvironmentVariables["SINGULARITY_UPDATE_GUARD"] = "windows-service";
         var url = Setting("panelurl");
         if (url.Length > 0) psi.EnvironmentVariables["SINGULARITY_PANEL_URL"] = url;
         var log = new StreamWriter(Path.Combine(Setting("datapath"), "service-console.log"), false);
@@ -950,6 +1113,22 @@ public class SingularityServiceHost : ServiceBase {
         stdin = proc.StandardInput;
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
+
+        if (guard != null) {
+            var watcher = new Thread(() => WatchUpdate(guard));
+            watcher.IsBackground = true;
+            watcher.Start();
+        }
+    }
+
+    private void WatchUpdate(UpdateGuard guard) {
+        if (guard.Wait(() => stopping) != UpdateGuard.Result.TimedOut) return;
+        //the new version did not come up: stop it, put the old one back, restart
+        stopping = true;
+        if (job != IntPtr.Zero) TerminateJobObject(job, 1);
+        try { proc.WaitForExit(15000); } catch { }
+        guard.Rollback();
+        Environment.Exit(1);
     }
 
     private void StopServer() {
