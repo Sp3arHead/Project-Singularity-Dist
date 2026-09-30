@@ -190,6 +190,10 @@ CREATED_DB_USER=0
 CREATED_SERVICE=0
 SERVICE_UNIT_BACKUP=""
 SERVICE_WAS_ACTIVE=0
+#other services stopped because they held a port, started again on rollback
+STOPPED_UNITS=()
+#processes started by hand that were stopped, they cannot be started again
+STOPPED_PROCESSES=()
 CREATED_GUARD_UNITS=0
 GUARD_UNITS_BACKUP=""
 CREATED_APACHE_SITE=0
@@ -277,6 +281,15 @@ rollback() {
         log "removed ${CREATED_PATHS[$i]}"
     done
 
+    local unit
+    for unit in "${STOPPED_UNITS[@]}"; do
+        run $SUDO systemctl start "$unit"
+        log "started $unit again"
+    done
+    if [[ ${#STOPPED_PROCESSES[@]} -gt 0 ]]; then
+        warn "These programs were stopped for the installation and must be started again by hand: ${STOPPED_PROCESSES[*]}"
+    fi
+
     if [[ $SERVICE_WAS_ACTIVE -eq 1 && $CREATED_SERVICE -eq 0 ]]; then
         run $SUDO systemctl start "$SERVICE_NAME"
         log "started the previously running service again"
@@ -363,6 +376,79 @@ port_in_use() {
     ss -Hltnu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]$1\$"
 }
 
+#"<pid> <program>" of the process listening on a port, empty if unknown
+port_owner() {
+    $SUDO ss -Hltnup 2>/dev/null \
+        | awk -v p="$1" '$5 ~ "[:.]" p "$" {print; exit}' \
+        | sed -nE 's/.*\(\("([^"]+)",pid=([0-9]+),.*/\2 \1/p' || true
+}
+
+#The system service a process belongs to, empty for anything started by hand
+process_unit() {
+    $SUDO cat "/proc/$1/cgroup" 2>/dev/null \
+        | sed -nE 's#^[0-9]+:[^:]*:/system\.slice/([^/]+\.service)(/.*)?$#\1#p' | head -n1 || true
+}
+
+#Ends a process started by hand and every process it started (the game server)
+stop_process_tree() {
+    local pid="$1" children i
+    children="$($SUDO pgrep -P "$pid" 2>/dev/null | tr '\n' ' ' || true)"
+    $SUDO kill -TERM "$pid" $children 2>/dev/null || true
+    for ((i = 0; i < 30; i++)); do
+        $SUDO kill -0 "$pid" 2>/dev/null || return 0
+        sleep 1
+    done
+    $SUDO kill -KILL "$pid" $children 2>/dev/null || true
+    sleep 1
+}
+
+wait_port_free() {
+    local i
+    for ((i = 0; i < 30; i++)); do
+        port_in_use "$1" || return 0
+        sleep 1
+    done
+    return 1
+}
+
+#A running server (an older install, txAdmin, a panel started by hand) usually
+#holds the ports. Say what it is and offer to stop it instead of just failing.
+free_port() {
+    local port="$1" owner pid prog unit cmd
+    owner="$(port_owner "$port")"
+    [[ -n "$owner" ]] || die "Port $port is already in use. Stop the program using it and run the installer again."
+    pid="${owner%% *}"
+    prog="${owner#* }"
+    unit="$(process_unit "$pid")"
+    cmd="$($SUDO tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120 || true)"
+    log "port $port is used by pid $pid ($prog), unit '${unit:-none}', command: $cmd"
+
+    if [[ -n "$unit" ]]; then
+        warn "Port $port is used by $prog (pid $pid) of the service $unit."
+        confirm "Stop $unit for the installation? It is started again if the installation fails." "y" \
+            || die "Port $port is in use by $unit. Stop it and run the installer again."
+        run $SUDO systemctl stop "$unit"
+        STOPPED_UNITS+=("$unit")
+    elif $SUDO grep -qa 'pm_id=' "/proc/$pid/environ" 2>/dev/null; then
+        local pm_id
+        pm_id="$($SUDO tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^pm_id=//p' | head -n1 || true)"
+        die "Port $port is used by $prog (pid $pid), which runs under pm2. Stop it with: pm2 stop ${pm_id:-<id>}, then run the installer again."
+    elif [[ "$prog" == *FXServer* || "$prog" == ld-musl* || "$cmd" == *FXServer* ]]; then
+        warn "Port $port is used by a running FXServer (pid $pid): $cmd"
+        warn "It was started by hand (screen, tmux or a console), so it cannot be started again automatically."
+        confirm "Stop this FXServer and its game server for the installation?" "n" \
+            || die "Port $port is in use by FXServer (pid $pid). Stop it and run the installer again."
+        stop_process_tree "$pid"
+        STOPPED_PROCESSES+=("FXServer(pid $pid)")
+        log "stopped FXServer pid $pid"
+    else
+        die "Port $port is used by $prog (pid $pid). Stop it and run the installer again."
+    fi
+
+    wait_port_free "$port" || die "Port $port is still in use after stopping $prog. Stop it by hand and run the installer again."
+    ok "Port $port is free now"
+}
+
 check_ports() {
     #a previous installation of this panel may be running, stop it for now
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -373,10 +459,24 @@ check_ports() {
     local port
     for port in "$PANEL_PORT" "$GAME_PORT"; do
         if port_in_use "$port"; then
-            die "Port $port is already in use. Stop the program using it and run the installer again."
+            free_port "$port"
         fi
     done
     ok "Ports $PANEL_PORT and $GAME_PORT are free"
+}
+
+#A service stopped for the ports would take them back at the next boot.
+disable_stopped_units() {
+    local unit
+    for unit in "${STOPPED_UNITS[@]}"; do
+        systemctl is-enabled --quiet "$unit" 2>/dev/null || continue
+        if confirm "$unit was stopped for this installation and would start again at boot, competing for the same ports. Disable it?" "y"; then
+            run $SUDO systemctl disable "$unit"
+            ok "Disabled $unit"
+        else
+            warn "$unit stays enabled; it will conflict with $SERVICE_NAME at the next boot."
+        fi
+    done
 }
 
 check_install_dir() {
@@ -1037,6 +1137,7 @@ main() {
     set_permissions
     start_and_verify
     rotate_backups
+    disable_stopped_units
 
     INSTALL_OK=1
     log "installation finished"
