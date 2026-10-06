@@ -8,6 +8,9 @@ reverse proxy and a Windows service. The rest happens in the browser wizard.
 Usage (elevated PowerShell):
     irm https://raw.githubusercontent.com/Sp3arHead/Project-Singularity-Dist/main/setup.ps1 | iex
 
+Or download setup.ps1 and right click > Run with PowerShell: it asks Windows
+for Administrator rights itself and keeps its window open at the end.
+
 With options:
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Sp3arHead/Project-Singularity-Dist/main/setup.ps1))) --dir D:\FiveM --yes
 
@@ -1420,4 +1423,41 @@ public class SingularityServiceHost : ServiceBase {
     }
 }
 
-Invoke-SingularityInstaller -CliArgs $args
+#MARK: Start
+#Started from the file (double click, "Run with PowerShell"), the console
+#window closes the moment the script ends, so every message, the error as
+#well as the wizard link, was gone before it could be read. That entry also
+#cannot run as Administrator. So when started from the file: ask Windows for
+#Administrator rights and start again, and keep the window open at the end.
+#Through `irm ... | iex` in an open console nothing of this applies.
+$sglFromFile = [bool]$PSCommandPath
+$sglKeepOpen = $args -contains '--pause'
+if ($sglFromFile -and -not $sglKeepOpen) {
+    try {
+        $sglParent = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId
+        $sglKeepOpen = (Get-Process -Id $sglParent -ErrorAction Stop).ProcessName -eq 'explorer'
+    } catch { }
+}
+$sglIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($sglFromFile -and -not $sglIsAdmin) {
+    Write-Host ''
+    Write-Host '  Project Singularity installer needs Administrator rights; Windows asks for them now.'
+    #the elevated window is not started by Explorer, so it is told to stay open
+    $sglArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"") +
+        @($args | Where-Object { $_ -ne '--pause' } | ForEach-Object { "`"$_`"" }) + @('--pause')
+    try {
+        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $sglArgs -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host '  Administrator rights were not granted, the installer did not run.' -ForegroundColor Red
+        Write-Host '  Start it again and confirm the Windows prompt, or run it from a PowerShell opened as Administrator.'
+        if ($sglKeepOpen) { Write-Host ''; [void](Read-Host '  Press Enter to close this window') }
+    }
+    return
+}
+
+try {
+    Invoke-SingularityInstaller -CliArgs @($args | Where-Object { $_ -ne '--pause' })
+} finally {
+    if ($sglKeepOpen) { Write-Host ''; [void](Read-Host '  Press Enter to close this window') }
+}
