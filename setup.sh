@@ -42,7 +42,7 @@ readonly MAX_MONITOR_BACKUPS=3
 readonly NET_TIMEOUT=30
 readonly NET_RETRIES=3
 readonly NET_RETRY_DELAY=5
-readonly SUPPORTED_OS="debian:11 debian:12 ubuntu:22.04 ubuntu:24.04"
+readonly SUPPORTED_OS="debian:11 debian:12 debian:13 ubuntu:22.04 ubuntu:24.04"
 
 
 #MARK: Options
@@ -73,7 +73,7 @@ Options:
 If Project Singularity is already installed, the installer offers to update
 or to uninstall it.
 
-Supported systems: Debian 11/12, Ubuntu 22.04/24.04.
+Supported systems: Debian 11/12/13, Ubuntu 22.04/24.04.
 EOF
 }
 
@@ -333,7 +333,7 @@ check_os() {
         die "FXServer for Linux only runs on x86_64, this machine is $(uname -m)."
     fi
     if [[ " $SUPPORTED_OS " != *" $id:$version "* ]]; then
-        warn "This system (${id:-unknown} ${version:-unknown}) is not supported. Supported: Debian 11/12, Ubuntu 22.04/24.04."
+        warn "This system (${id:-unknown} ${version:-unknown}) is not supported. Supported: Debian 11/12/13, Ubuntu 22.04/24.04."
         confirm "Continue anyway?" "y" || die "Aborted by user."
     else
         ok "System: $id $version"
@@ -766,11 +766,21 @@ choose_artifact() {
         fi
     fi
 
-    #build number <tab> download url, newest first
+    #build number <tab> download url, newest first.
+    #The Cfx page used to be a plain directory index with relative links
+    #("./37175-<hash>/fx.tar.xz"); it is now an app that embeds absolute
+    #download URLs in JSON. Both forms are read. No match must not end the
+    #installer (set -e + pipefail): the fallback below takes over then.
     if listing="$(fetch "$CFX_LISTING_URL")"; then
-        listing="$(grep -oE '\./[0-9]+-[0-9a-f]+/fx\.tar\.xz' <<<"$listing" \
-            | sed -E "s#^\./(([0-9]+)-[0-9a-f]+/fx\.tar\.xz)#\2\t${CFX_LISTING_URL}\1#" \
-            | sort -t$'\t' -k1,1nr | awk -F'\t' '!seen[$1]++')"
+        listing="$(
+            {
+                { grep -oE "${CFX_LISTING_URL//./\\.}[0-9]+-[0-9a-f]+/fx\.tar\.xz" <<<"$listing" || true; } \
+                    | sed -E "s#^${CFX_LISTING_URL//./\\.}##"
+                { grep -oE '\./[0-9]+-[0-9a-f]+/fx\.tar\.xz' <<<"$listing" || true; } | sed -E 's#^\./##'
+            } \
+                | sed -E "s#^(([0-9]+)-[0-9a-f]+/fx\.tar\.xz)\$#\2\t${CFX_LISTING_URL}\1#" \
+                | sort -t$'\t' -k1,1nr | awk -F'\t' '!seen[$1]++'
+        )" || listing=""
     else
         listing=""
     fi
