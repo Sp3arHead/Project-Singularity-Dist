@@ -728,7 +728,9 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
         } catch { Write-Log "listing failed: $($_.Exception.Message)" }
         if ($listing) {
             $seen = @{}
-            foreach ($m in [regex]::Matches($listing, '\./((\d+)-[0-9a-f]+)/server\.7z')) {
+            #The Cfx page used to list relative "./<build>-<hash>/server.7z" links;
+            #it now embeds absolute download URLs. Both forms are read.
+            foreach ($m in [regex]::Matches($listing, '(?:\./|build_server_windows/master/)((\d+)-[0-9a-f]+)/server\.7z')) {
                 $num = $m.Groups[2].Value
                 if ($seen[$num]) { continue }
                 $seen[$num] = $true
