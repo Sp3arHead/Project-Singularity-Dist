@@ -338,6 +338,12 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
         if ($full -notmatch '^[A-Za-z]:\\[A-Za-z0-9._\\ -]*$' -or $full.Length -le 3) {
             Fail 'The installation folder may only contain letters, numbers, spaces, dots, dashes and underscores, and cannot be a drive root.'
         }
+        #Windows strips leading/trailing spaces and trailing dots from path parts,
+        #so a folder like "Desktop\ \server" cannot be written to by most tools
+        $bad = $full.Substring(3).Split('\') | Where-Object { $_ -ne '' -and ($_ -ne $_.Trim() -or $_.EndsWith('.')) } | Select-Object -First 1
+        if ($null -ne $bad) {
+            Fail "The folder name '$bad' in $full starts or ends with a space or ends with a dot. Windows does not handle such names reliably, choose another folder (for example C:\FiveM)."
+        }
         $parent = Split-Path -Parent $full
         while ($parent -and -not (Test-Path -LiteralPath $parent)) { $parent = Split-Path -Parent $parent }
         try {
@@ -480,7 +486,16 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
         if ($dbExists -ne '0' -or $userExists -ne '0') {
             Warn "Database $DbName or user $DbUser already exists without a panel configuration (for example after an uninstall that kept the database)."
             if (-not (Confirm-Choice "Reuse it? The user $DbUser gets a new password, the data is kept." $true)) {
-                Fail "Remove the database $DbName and the user $DbUser, or run the installer again and reuse them."
+                if (-not (Confirm-Choice "Delete the database $DbName and the user $DbUser and set them up fresh? All data in it is lost." $false)) {
+                    Fail "Remove the database $DbName and the user $DbUser, or run the installer again and reuse them."
+                }
+                $sql = "DROP DATABASE IF EXISTS ``$DbName``;`n"
+                foreach ($h in $DbUserHosts) { $sql += "DROP USER IF EXISTS '$DbUser'@'$h';`n" }
+                Invoke-MySql $sql | Out-Null
+                Write-Log "deleted the existing database $DbName and user $DbUser"
+                Ok "Old database $DbName and user $DbUser deleted"
+                $dbExists = '0'
+                $userExists = '0'
             }
         }
 
@@ -638,6 +653,50 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
         return $null
     }
 
+    #Apache Lounge replaces its zips under the same URL, which breaks the hash in
+    #the winget manifest. The zip is taken from the download page instead and
+    #checked against the SHA256 published next to it.
+    function Install-ApacheDirect {
+        $base = 'https://www.apachelounge.com'
+        Info 'Downloading Apache from Apache Lounge'
+        $page = Invoke-Fetch "$base/download/"
+        if (-not $page) { throw 'the download page could not be loaded' }
+        $m = [regex]::Match([string]$page, 'href="(/download/[^"]+/httpd-[^"/]+-Win64-VS\d+\.zip)"')
+        if (-not $m.Success) { throw 'no Win64 zip was found on the download page' }
+        $zipUrl = $base + $m.Groups[1].Value
+        $sums = [string](Invoke-Fetch "$zipUrl.txt")
+        $sm = [regex]::Match($sums, '(?s)SHA256-Checksum for:[^\r\n]*\r?\n\s*([0-9A-Fa-f]{64})')
+        if (-not $sm.Success) { throw 'no SHA256 checksum was published for the zip' }
+        $zip = Join-Path $WorkDir 'httpd.zip'
+        Invoke-Download $zipUrl $zip
+        $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+        if ($hash -ne $sm.Groups[1].Value.ToUpper()) { throw "checksum mismatch ($hash)" }
+        Write-Log "verified $zipUrl ($hash)"
+
+        #the VS18 builds need the Visual C++ runtime 14.50 or newer
+        $vc = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction SilentlyContinue
+        if (-not $vc -or $vc.Installed -ne 1 -or [int]$vc.Minor -lt 50) {
+            Info 'Installing the Visual C++ runtime'
+            $redist = Join-Path $WorkDir 'vc_redist.x64.exe'
+            Invoke-Download 'https://aka.ms/vc14/vc_redist.x64.exe' $redist
+            $sig = Get-AuthenticodeSignature -LiteralPath $redist
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'the Visual C++ runtime installer is not signed by Microsoft' }
+            $p = Start-Process -FilePath $redist -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+            #3010: installed, restart pending
+            if ($p.ExitCode -notin @(0, 1638, 3010)) { throw "the Visual C++ runtime installer exited with code $($p.ExitCode)" }
+            Ok 'Visual C++ runtime installed'
+        }
+
+        $extract = Join-Path $WorkDir 'httpd'
+        New-Item -ItemType Directory -Path $extract -Force | Out-Null
+        Invoke-Logged 'tar.exe' @('-xf', $zip, '-C', $extract)
+        if (-not (Test-Path -LiteralPath (Join-Path $extract 'Apache24\bin\httpd.exe'))) { throw 'the zip has no Apache24 folder' }
+        if (Test-Path -LiteralPath 'C:\Apache24') { throw 'C:\Apache24 already exists without httpd.exe' }
+        Move-Item -LiteralPath (Join-Path $extract 'Apache24') -Destination 'C:\Apache24'
+        Ok 'Apache installed in C:\Apache24'
+        return [bool](Find-Apache)
+    }
+
     function Select-Apache {
         if ($opt.NoApache) { Write-Log 'Apache skipped (--no-apache)'; return $null }
         $apache = Find-Apache
@@ -646,7 +705,9 @@ Supported systems: Windows 10, Windows 11, Windows Server 2019, Windows Server 2
                 Write-Log "Apache declined, the panel is reached via port $PanelPort"
                 return $null
             }
-            if (-not (Install-Package 'Apache' 'ApacheLounge.httpd' { [bool](Find-Apache) } 'https://www.apachelounge.com/download/')) {
+            $direct = $false
+            try { $direct = Install-ApacheDirect } catch { Warn "Direct Apache download failed ($($_.Exception.Message)), trying winget." }
+            if (-not $direct -and -not (Install-Package 'Apache' 'ApacheLounge.httpd' { [bool](Find-Apache) } 'https://www.apachelounge.com/download/')) {
                 Warn "Continuing without Apache, the panel is reached via port $PanelPort."
                 return $null
             }

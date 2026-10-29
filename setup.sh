@@ -643,8 +643,21 @@ create_database() {
     #with the old panel config, so the user gets a new one
     if [[ "$db_exists" != "0" || "$user_exists" != "0" ]]; then
         warn "Database $DB_NAME or user $DB_USER already exists without a panel configuration (for example after an uninstall that kept the database)."
-        confirm "Reuse it? The user $DB_USER gets a new password, the data is kept." "y" \
-            || die "Remove the database $DB_NAME and the user $DB_USER, or run the installer again and reuse them."
+        if ! confirm "Reuse it? The user $DB_USER gets a new password, the data is kept." "y"; then
+            confirm "Delete the database $DB_NAME and the user $DB_USER and set them up fresh? All data in it is lost." "n" \
+                || die "Remove the database $DB_NAME and the user $DB_USER, or run the installer again and reuse them."
+            local db_host
+            {
+                printf 'DROP DATABASE IF EXISTS `%s`;\n' "$DB_NAME"
+                for db_host in "${DB_USER_HOSTS[@]}"; do
+                    printf "DROP USER IF EXISTS '%s'@'%s';\n" "$DB_USER" "$db_host"
+                done
+            } | mysql_root
+            log "deleted the existing database $DB_NAME and user $DB_USER"
+            ok "Old database $DB_NAME and user $DB_USER deleted"
+            db_exists="0"
+            user_exists="0"
+        fi
     fi
 
     DB_PASSWORD="$(random_secret 32)"
